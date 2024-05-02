@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import time
+import json
+import random
+
+# Constants
+BROADCAST = "FFFF"
+LEADER = "leader"
+CANDIDATE = "candidate"
+FOLLOWER = "follower"
+APPEND_ENTRIES = "appendEntries"
+REQUEST_VOTES = "request_votes"
+
+# Replica class
+class Replica:
+    def __init__(self, port, id, others):
+        # Initialize replica with port number, ID, and list of other replicas.
+        self.port = port
+        self.id = id
+        self.others = others
+        
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('localhost', 0))
+        self.socket.settimeout(0.1)  # Set timeout for non-blocking socket operations
+
+        print(f"Replica {self.id} starting up", flush=True)
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
+        self.send(hello)
+        print(f"Sent hello message: {hello}", flush=True)
+
+        self.state = FOLLOWER
+        self.leader = BROADCAST
+        self.term = 0
+        self.log = {}
+        self.votes = 1
+        self.terms_voted = set()
+        self.clock = time.time()
+        self.last_heartbeat_time = time.time()
+        self.heartbeat_interval = 0.1  # Define heartbeat interval
+
+        if self.id == "0000":
+            time.sleep(1)
+            self.request_vote()
+
+    # Send a message to the specified destination
+    def send(self, message):
+        self.socket.sendto(json.dumps(message).encode('utf-8'), ('localhost', self.port))
+
+    # Process a vote response and check if the candidate has enough votes to become leader
+    def process_vote_response(self, message):
+        if message["type"] == "yesVote" and self.state == CANDIDATE:
+            self.votes += 1
+            if self.votes >= 3 and self.state != LEADER:
+                self.state = LEADER
+                self.leader = self.id
+                leader_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": APPEND_ENTRIES, "term": self.term, "log": self.log}
+                self.send(leader_msg)
+
+        self.clock = time.time()
+
+    # Send a heartbeat message to all replicas
+    def heartbeat(self):
+        heartbeat_msg = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": "heartbeat"}
+        self.send(heartbeat_msg)
+
+    # Request votes from all replicas
+    def request_vote(self):
+        self.state = CANDIDATE
+        self.term += 1
+        req = {"src": self.id, "dst": BROADCAST, "leader": self.leader, "type": REQUEST_VOTES, "term": self.term}
+        self.votes = 1
+        self.terms_voted.add(self.term)
+        self.send(req)
+
+    # Process a vote request and send a response
+    def process_vote_request(self, message):
+        if message["type"] == REQUEST_VOTES and self.state == FOLLOWER:
+            response = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": ""}
+            if not message["term"] in self.terms_voted:
+                response["type"] = "yesVote"
+                self.terms_voted.add(message["term"])
+            else:
+                response["type"] = "noVote"
+            self.send(response)
+
+        self.clock = time.time()
+
+    # Process a request to put a key-value pair in the log
+    def put_req(self, message):
+        self.log[message["key"]] = message["value"]
+        ok = {"src": message["dst"], "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"]}
+        new_entry = {message["key"]: message["value"]}
+        self.send({"src": message["dst"], "dst": BROADCAST, "leader": self.leader, "type": APPEND_ENTRIES, "term": self.term, "log": new_entry})
+        self.clock = time.time()
+        return ok
+    
+    # Handle a get request
+    def handle_get_request(self, message):
+        msg_key = message["key"]
+        msg_value = self.log.get(msg_key, "")
+        ok = {"src": message["dst"], "dst": message["src"], "leader": self.leader, "type": "ok", "MID": message["MID"], "value": msg_value}
+        self.clock = time.time()
+        return ok
+    
+    # Main loop
+    def run(self):
+        while True:
+            try:
+                # Non-blocking receive
+                data, addr = self.socket.recvfrom(65535)
+                msg = data.decode('utf-8')
+                message = json.loads(msg)
+                self.handle_message(message)
+            except socket.timeout:
+                # No message received
+                pass
+
+            # Check and send heartbeats or handle timeouts
+            self.manage_timeouts()
+
+    def manage_timeouts(self):
+        current_time = time.time()
+        # Check for leader timeout in FOLLOWERS
+        if self.state == FOLLOWER and (current_time - self.last_heartbeat_time > 3 * self.heartbeat_interval):
+            self.request_vote()
+
+        # Check for heartbeat interval in LEADER
+        if self.state == LEADER and (current_time - self.last_heartbeat_time >= self.heartbeat_interval):
+            self.heartbeat()
+            self.last_heartbeat_time = current_time
+
+        # Re-election timeout for CANDIDATES
+        if self.state == CANDIDATE and (current_time - self.clock > random.uniform(0.15, 0.3)):
+            self.request_vote()
+    # Handle a message based on its type
+    def handle_message(self, message):
+        message_type = message["type"]
+
+        if message_type == REQUEST_VOTES:
+            self.process_vote_request(message)
+        elif message_type in ["yesVote", "noVote"]:
+            self.process_vote_response(message)
+        elif message_type == "get":
+            if self.state == LEADER:
+                response = self.handle_get_request(message)
+                self.send(response)
+            else:
+                self.redirect_request(message)
+        elif message_type == "put":
+            if self.state == LEADER:
+                response = self.put_req(message)
+                self.send(response)
+            else:
+                self.redirect_request(message)
+        elif message_type == APPEND_ENTRIES:
+            self.process_append_entries(message)
+
+    # Process an append entries message
+    def process_append_entries(self, message):
+        if message["term"] >= self.term:
+            self.term = message["term"]
+            self.state = FOLLOWER
+            self.leader = message["leader"]
+            self.log.update(message["log"])
+            self.last_heartbeat_time = time.time()
+
+    # Redirect a request to the leader
+    def redirect_request(self, message):
+        redirect_message = {"src": self.id, "dst": message["src"], "leader": self.leader, "type": "redirect", "MID": message["MID"]}
+        self.send(redirect_message)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='run a key-value store')
+    parser.add_argument('port', type=int, help="Port number to communicate")
+    parser.add_argument('id', type=str, help="ID of this replica")
+    parser.add_argument('others', metavar='others', type=str, nargs='+', help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    replica.run()
